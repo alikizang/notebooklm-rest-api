@@ -238,6 +238,12 @@ async def add_account(req: AccountAddReq):
     os.makedirs(ACCOUNTS_DIR, exist_ok=True)
     try:
         cookies_data = json.loads(req.cookies_json)
+        # Automatically wrap flat JSON cookie arrays in Playwright's required storage state format
+        if isinstance(cookies_data, list):
+            cookies_data = {
+                "cookies": cookies_data,
+                "origins": []
+            }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON format: {e}")
         
