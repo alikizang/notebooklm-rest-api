@@ -1835,7 +1835,9 @@ async def start_job(req: Dict[str, Any], background_tasks: BackgroundTasks):
             }
             
         except Exception as e:
-            logger.error(f"Course generation failed for job {job_id}: {e}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            logger.error(f"Course generation failed for job {job_id}: {e}\n{traceback_str}")
             jobs_db[job_id]["status"] = "failed"
             jobs_db[job_id]["logs"].append(f"FAILED: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Course generation failed: {str(e)}")
