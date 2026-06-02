@@ -80,6 +80,7 @@ def map_rpc_error(e: RPCError) -> HTTPException:
 class AccountAddReq(BaseModel):
     cookies_json: str
     label: Optional[str] = None
+    skip_validation: bool = False
 
 
 class NotebookCreateReq(BaseModel):
@@ -233,6 +234,93 @@ async def list_accounts():
     accounts.sort(key=lambda x: x.get("created_at", 0))
     return {"ok": True, "accounts": accounts}
 
+def _preprocess_cookie_editor_json(cookies_data: dict) -> dict:
+    """Normalize Cookie-Editor export format for notebooklm-py compatibility.
+    
+    Cookie-Editor uses 'expirationDate' instead of 'expires', and 'sameSite'
+    values like 'no_restriction' instead of 'None'. This normalizes the format
+    to match the Playwright storage_state.json schema that notebooklm-py expects.
+    """
+    if "cookies" not in cookies_data:
+        return cookies_data
+    
+    normalized_cookies = []
+    for cookie in cookies_data.get("cookies", []):
+        c = dict(cookie)  # shallow copy
+        
+        # Normalize expirationDate -> expires (Cookie-Editor format)
+        if "expirationDate" in c and "expires" not in c:
+            c["expires"] = c.pop("expirationDate")
+        
+        # Normalize sameSite values (Cookie-Editor uses 'no_restriction', 'lax', 'strict')
+        same_site = c.get("sameSite", "")
+        if isinstance(same_site, str):
+            same_site_lower = same_site.lower()
+            if same_site_lower in ("no_restriction", "unspecified", "none"):
+                c["sameSite"] = "None"
+            elif same_site_lower == "lax":
+                c["sameSite"] = "Lax"
+            elif same_site_lower == "strict":
+                c["sameSite"] = "Strict"
+        
+        # Remove Cookie-Editor specific fields that Playwright doesn't use
+        for extra_key in ["hostOnly", "session", "storeId", "id"]:
+            c.pop(extra_key, None)
+        
+        # Ensure domain has leading dot for cross-subdomain cookies
+        domain = c.get("domain", "")
+        name = c.get("name", "")
+        
+        # SID-family cookies should always be scoped to .google.com
+        google_wide_cookies = {
+            "SID", "HSID", "SSID", "APISID", "SAPISID",
+            "__Secure-1PSID", "__Secure-3PSID",
+            "__Secure-1PAPISID", "__Secure-3PAPISID",
+            "__Secure-1PSIDTS", "__Secure-3PSIDTS",
+            "LSID"
+        }
+        if name in google_wide_cookies and domain and "google.com" in domain:
+            if domain not in (".google.com", "google.com"):
+                c["domain"] = ".google.com"
+        
+        normalized_cookies.append(c)
+    
+    cookies_data["cookies"] = normalized_cookies
+    return cookies_data
+
+
+def _validate_cookies_offline(cookies_data: dict) -> tuple[bool, str]:
+    """Check that the minimum required cookies are present without making network requests.
+    
+    Returns (is_valid, error_message). If is_valid is True, error_message is empty.
+    """
+    cookie_names = set()
+    for cookie in cookies_data.get("cookies", []):
+        name = cookie.get("name", "")
+        if name:
+            cookie_names.add(name)
+    
+    required = {"SID", "__Secure-1PSIDTS"}
+    missing = required - cookie_names
+    
+    if missing:
+        found_list = sorted(cookie_names)[:8]
+        return False, (
+            f"Missing required cookies: {missing}. "
+            f"Found: {found_list}{'...' if len(cookie_names) > 8 else ''}. "
+            f"Make sure you export ALL cookies from notebooklm.google.com "
+            f"(the SID cookie is set on .google.com domain and should be visible)."
+        )
+    
+    # Check for secondary binding (OSID or APISID+SAPISID)
+    has_osid = "OSID" in cookie_names
+    has_api_pair = {"APISID", "SAPISID"} <= cookie_names
+    if not has_osid and not has_api_pair:
+        return True, ""  # Warn but don't block - it may still work
+    
+    return True, ""
+
+
 @app.post("/v1/auth/accounts")
 async def add_account(req: AccountAddReq):
     os.makedirs(ACCOUNTS_DIR, exist_ok=True)
@@ -244,20 +332,63 @@ async def add_account(req: AccountAddReq):
                 "cookies": cookies_data,
                 "origins": []
             }
+        # Preprocess Cookie-Editor format to Playwright-compatible format
+        cookies_data = _preprocess_cookie_editor_json(cookies_data)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON format: {e}")
-        
+    
+    # Offline validation — check required cookies are present in the JSON
+    is_valid, offline_error = _validate_cookies_offline(cookies_data)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=offline_error)
+    
+    # Determine validation mode
+    skip_validation = req.skip_validation
+    validation_status = "unverified"
+    validation_message = ""
+    
     temp_fd, temp_path = tempfile.mkstemp(suffix=".json")
     try:
         with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
             json.dump(cookies_data, f)
-            
-        try:
-            client = await NotebookLMClient.from_storage(temp_path)
-            async with client:
-                await client.notebooks.list()
-        except Exception as auth_err:
-            raise HTTPException(status_code=400, detail=f"Google Account validation failed. The cookies may be invalid or expired. Error: {auth_err}")
+        
+        if not skip_validation:
+            # Attempt live validation — but gracefully handle IP-mismatch redirects
+            try:
+                client = await NotebookLMClient.from_storage(temp_path)
+                async with client:
+                    await client.notebooks.list()
+                validation_status = "active"
+                validation_message = "Live validation successful."
+            except Exception as auth_err:
+                err_str = str(auth_err)
+                # Detect Google redirect (IP mismatch / session not trusted on this IP)
+                if "Redirected to" in err_str and "accounts.google.com" in err_str:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Google rejected the session from this server's IP address. "
+                            f"This is normal — Google ties sessions to the IP where they were created. "
+                            f"The cookies appear structurally valid (SID and __Secure-1PSIDTS are present). "
+                            f"Click 'Save Without Validation' to save the account anyway — "
+                            f"the session will be re-authenticated automatically during video rendering."
+                        ),
+                        headers={"X-Validation-Hint": "skip_validation"}
+                    )
+                elif "Missing required cookies" in err_str:
+                    raise HTTPException(status_code=400, detail=f"Cookie validation failed: {err_str}")
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Google Account validation failed. Error: {err_str}. "
+                            f"You can try 'Save Without Validation' to save the cookies anyway."
+                        ),
+                        headers={"X-Validation-Hint": "skip_validation"}
+                    )
+        else:
+            validation_status = "unverified"
+            validation_message = "Saved without live validation (cookies are structurally valid)."
             
         account_id = str(uuid.uuid4())[:8]
         cookie_path, meta_path = get_account_paths(account_id)
@@ -269,9 +400,11 @@ async def add_account(req: AccountAddReq):
         meta = {
             "id": account_id,
             "label": label,
-            "status": "active",
+            "status": validation_status,
             "created_at": time.time()
         }
+        if validation_message:
+            meta["message"] = validation_message
         
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f)
